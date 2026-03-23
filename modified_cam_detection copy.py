@@ -19,6 +19,26 @@ last_reminder_info = {
     'time': 0
 }
 
+# MiDaS 单目深度估计全局变量
+midas_model = None
+midas_transform = None
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def init_midas():
+    """初始化MiDaS_small深度估计模型"""
+    global midas_model, midas_transform
+    print("正在加载MiDaS_small深度估计模型...")
+    midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+    midas.to(device)
+    midas.eval()
+    
+    # 加载预处理变换
+    midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+    midas_transform = midas_transforms.small_transform
+    
+    print(f"MiDaS_small模型加载完成，运行设备：{device}")
+    return midas, midas_transform
+
 def generate_colors(num_classes):
     """Generate a list of distinct colors for visualization."""
     np.random.seed(42)  # For reproducibility
@@ -380,11 +400,40 @@ def process_frame(frame, result, colors, fps):
     """Process a single frame with detection results and provide audio guidance."""
     boxes = result.boxes
     masks = result.masks
+    global midas_model, midas_transform, device
     
     # Calibration factor based on known measurements
     # For a person at 0.762 meters, we were getting readings around 0.4 units
     # So our correction factor is 0.762/0.4 ≈ 1.905
     depth_correction_factor = 0.01176
+    
+    # MiDaS全局深度估计
+    depth_map = None
+    if midas_model is not None:
+        try:
+            # 图像预处理
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_batch = midas_transform(img_rgb).to(device)
+            
+            # 推理预测
+            with torch.no_grad():
+                prediction = midas_model(input_batch)
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=img_rgb.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+            
+            # 转换为numpy深度图，值越大距离越近
+            depth_map = prediction.cpu().numpy()
+            # 归一化便于可视化（可选）
+            depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
+            cv2.imshow("MiDaS深度图", depth_vis)
+        except Exception as e:
+            print(f"MiDaS推理失败: {e}")
+            depth_map = None
     
     # 各类别平均实际高度映射（单位：米），用于距离计算
     CLASS_HEIGHT = {
@@ -492,10 +541,32 @@ def process_frame(frame, result, colors, fps):
                 print(f"截边补全：{cls_name} {truncate_type}超出画面，宽高比估算高度{truncated_estimated_height:.0f}px，最终高度{corrected_box_height:.0f}px")
         
         # 使用补全后的高度计算距离
-        if corrected_box_height > 0 and cls_name.lower() in CLASS_HEIGHT:
-            # 基于小孔成像原理计算距离（比原有算法精度提升20%以上）
+        depth_estimate = None
+        # 优先使用MiDaS深度估计（更准确，支持所有类别，不受遮挡/截边影响）
+        if depth_map is not None and corrected_box_height > 0:
+            try:
+                # 提取目标bounding box区域的深度值，取中位数减少异常值影响
+                x1_clamp = max(0, x1)
+                y1_clamp = max(0, y1)
+                x2_clamp = min(depth_map.shape[1] - 1, x2)
+                y2_clamp = min(depth_map.shape[0] - 1, y2)
+                if x2_clamp > x1_clamp and y2_clamp > y1_clamp:
+                    obj_depth_region = depth_map[y1_clamp:y2_clamp, x1_clamp:x2_clamp]
+                    if obj_depth_region.size > 0:
+                        # MiDaS输出值越大距离越近，取中位数后换算为真实距离（0.05为校准系数，可按需调整）
+                        midas_relative_depth = np.median(obj_depth_region)
+                        depth_estimate = 1192.5 / midas_relative_depth  # 校准公式：真实距离 = 校准系数 / 相对深度值
+                        print(f"MiDaS测距：{cls_name} 深度{depth_estimate:.2f}m")
+            except Exception as e:
+                print(f"MiDaS测距失败: {e}")
+                depth_estimate = None
+        
+        # MiDaS失效时 fallback 到传统几何测距
+        if depth_estimate is None and corrected_box_height > 0 and cls_name.lower() in CLASS_HEIGHT:
+            # 基于小孔成像原理计算距离
             real_height = CLASS_HEIGHT[cls_name.lower()]
             depth_estimate = (FOCAL_LENGTH * real_height) / corrected_box_height
+            print(f"几何测距：{cls_name} 深度{depth_estimate:.2f}m")
             
             # 收集3米以内的近距离障碍物
             if depth_estimate <= 3.0:
@@ -642,6 +713,15 @@ def main():
         print(f"Error loading YOLO model: {e}")
         print("Make sure the model file exists and ultralytics is installed correctly.")
         return
+    
+    # 初始化MiDaS深度估计模型
+    global midas_model, midas_transform
+    try:
+        midas_model, midas_transform = init_midas()
+    except Exception as e:
+        print(f"加载MiDaS模型失败: {e}")
+        print("将使用传统几何测距模式")
+        midas_model = None
     
     # Define colors for visualization
     colors = generate_colors(80)
